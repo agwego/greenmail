@@ -2,16 +2,26 @@ package com.icegreen.greenmail.standalone;
 
 import com.icegreen.greenmail.configuration.GreenMailConfiguration;
 import com.icegreen.greenmail.configuration.PropertiesBasedGreenMailConfigurationBuilder;
+import com.icegreen.greenmail.imap.AuthorizationException;
+import com.icegreen.greenmail.imap.ImapHostManager;
 import com.icegreen.greenmail.server.BuildInfo;
+import com.icegreen.greenmail.store.FolderException;
+import com.icegreen.greenmail.user.GreenMailUser;
+import com.icegreen.greenmail.user.UserManager;
 import com.icegreen.greenmail.util.GreenMail;
 import com.icegreen.greenmail.util.PropertiesBasedServerSetupBuilder;
 import com.icegreen.greenmail.util.ServerSetup;
+import jakarta.mail.Session;
+import jakarta.mail.internet.MimeMessage;
 import org.apache.logging.log4j.core.LoggerContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.bridge.SLF4JBridgeHandler;
 
+import java.io.File;
+import java.io.InputStream;
 import java.io.PrintStream;
+import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.Properties;
 
@@ -53,6 +63,88 @@ public class GreenMailStandaloneRunner {
                 log.info("Starting GreenMail API server at {}", apiServer.getUri());
                 apiServer.start();
             }
+
+            postStart( properties );
+        }
+    }
+
+    /**
+     * Run post startup commands create folders, add .eml files or director of .eml files
+     *
+     * @param properties configuration
+     */
+    protected void postStart( Properties properties ) {
+        // greenmail.foldersCreate = "userId:folder1,folder2,..."
+        if( properties.containsKey( "greenmail.foldersCreate" ) ) {
+            final String foldersProp = properties.getProperty( "greenmail.foldersCreate" );
+            final String foldersUser = foldersProp.substring( 0, foldersProp.indexOf( ":" ) );
+            final String[] folderNames = foldersProp.substring( foldersProp.indexOf( ":" ) + 1 ).split( "," );
+
+            final UserManager userManager = greenMail.getManagers().getUserManager();
+            GreenMailUser gmu = userManager.getUser( foldersUser );
+            try {
+                final ImapHostManager imapHostManager = greenMail.getManagers().getImapHostManager();
+                for( String folderName : folderNames )
+                    imapHostManager.createMailbox( gmu, folderName );
+            } catch( AuthorizationException | FolderException ex ) {
+                log.error( "Error creating folder {}, message: {}", folderNames, ex.getMessage() );
+            }
+        }
+
+         // greenmail.emlFilesDirLoad = "userId:/path/to/emls/dir"
+        if( properties.containsKey( "greenmail.emlFilesDirLoad" ) ) {
+            final String emlDirProp = properties.getProperty( "greenmail.emlFilesDirLoad" );
+            final String emlUser = emlDirProp.substring( 0, emlDirProp.indexOf( ":" ) );
+            final String emlDir = emlDirProp.substring( emlDirProp.indexOf( ":" ) + 1 );
+
+            try {
+                File emlLoadDir = new File( emlDir );
+                File[] emlFiles = emlLoadDir.listFiles( pathname -> !pathname.toString().contains( "README" ) );
+
+                if( emlFiles == null || emlFiles.length == 0 ) {
+                    log.warn( "No eml files to load: {}", emlDir );
+                    return;
+                }
+
+                for( File emlFile : emlFiles ) {
+                    emlFileInboxAdd( emlUser, emlFile );
+                }
+            } catch( Exception ex ) {
+                log.error( "Exception loading {} eml file", properties.getProperty( "greenmail.imap.loadEmlFile" ) );
+            }
+        }
+
+        // greenmail.emlFileLoad="userId:/path/to/eml/<some file name>.eml"
+        if( properties.containsKey( "greenmail.emlFileLoad" ) ) {
+            final String emlFileProp = properties.getProperty( "greenmail.imap.loadEmlFile" );
+            final String emlUser = emlFileProp.substring( 0, emlFileProp.indexOf( ":" ) );
+            final String emlFile = emlFileProp.substring( emlFileProp.indexOf( ":" ) + 1 );
+
+            try {
+                emlFileInboxAdd( emlUser, new File( emlFile ) );
+            } catch( Exception ex ) {
+                log.error( "Exception {} loading {} eml file", ex.getClass().getSimpleName(), properties.getProperty( "greenmail.imap.loadEmlFile" ) );
+            }
+        }
+    }
+
+    /**
+     * add a .eml file to a users INBOX
+     *
+     * @param emlUser greenmail user
+     * @param emlFile .eml file in question
+     *
+     * @throws Exception if there are any issues
+     */
+    public void emlFileInboxAdd( final String emlUser, final File emlFile ) throws Exception {
+        final UserManager userManager = greenMail.getManagers().getUserManager();
+        GreenMailUser gmu = userManager.getUser( emlUser );
+
+        final Session session = greenMail.getSmtp().createSession();
+        final ImapHostManager imapHostManager = greenMail.getManagers().getImapHostManager();
+        try( InputStream source = Files.newInputStream( emlFile.toPath() ) ) {
+            final MimeMessage loadedMsg = new MimeMessage( session, source );
+            imapHostManager.getFolder( gmu, "INBOX" ).store( loadedMsg );
         }
     }
 
